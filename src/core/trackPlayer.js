@@ -1,46 +1,98 @@
-import { lerpPos, safeOrientation } from "./math";
+import * as Cesium from "cesium";
 
-export class TrackPlayer {
-  constructor(points) {
-    this.points = points;
-    this.start = points[0].t;
-    this.end = points.at(-1).t;
-    this.time = this.start;
-    this.speed = 1;
-    this.cursor = 0;
-    this.lastOrientation = null;
-  }
-
-  seek(t) {
-    this.time = t;
-    this.cursor = 0;
-  }
-
-  update(dt) {
-    this.time += dt * this.speed;
-    if (this.time > this.end) this.time = this.end;
-
-    while (
-      this.cursor < this.points.length - 2 &&
-      this.time > this.points[this.cursor + 1].t
-    ) {
-      this.cursor++;
+export default class TrackPlayer {
+  /**
+   * @param {Array} points - 轨迹点数组，每个点 { p: [lon, lat, alt], orientation?: Cesium.Quaternion }
+   * @param {number} duration - 总动画时长（毫秒）
+   */
+  constructor(points, duration = 10000) {
+    if (!points || points.length < 2) {
+      throw new Error("轨迹点至少需要 2 个");
     }
 
-    const p1 = this.points[this.cursor];
-    const p2 = this.points[this.cursor + 1];
-    const alpha = (this.time - p1.t) / (p2.t - p1.t);
+    this.points = points.map((p) => ({
+      position: p.p,
+      orientation: p.orientation || null,
+    }));
 
-    const pos = lerpPos(p1.p, p2.p, alpha);
+    this.duration = duration; // 总动画时间 ms
+    this.speed = 1; // 倍速
+    this.time = 0; // 当前动画时间 ms
+    this.loop = true; // 是否循环
+  }
 
-    const prev = this.points[Math.max(this.cursor - 1, 0)].p;
-    const next = this.points[Math.min(this.cursor + 2, this.points.length - 1)].p;
+  /**
+   * 更新动画状态
+   * @param {number} dt - 增量时间，毫秒
+   * @returns {Object} { position, orientation }
+   */
+  update(dt) {
+    if (!this.points || this.points.length < 2) return null;
 
-    this.lastOrientation = safeOrientation(pos, next, this.lastOrientation)
-    return {
-      position: pos,
-      orientation: this.lastOrientation,
-      progress: (this.time - this.start) / (this.end - this.start)
-    };
+    this.time += dt * this.speed;
+
+    // 循环播放
+    if (this.loop) {
+      this.time %= this.duration;
+    } else {
+      this.time = Math.min(this.time, this.duration);
+    }
+
+    // 均匀分配轨迹点时间
+    const segmentCount = this.points.length - 1;
+    const segmentDuration = this.duration / segmentCount;
+
+    let segmentIndex = Math.floor(this.time / segmentDuration);
+    if (segmentIndex >= segmentCount) segmentIndex = segmentCount - 1;
+
+    const t0 = segmentIndex * segmentDuration;
+    const t1 = (segmentIndex + 1) * segmentDuration;
+
+    const localT = (this.time - t0) / (t1 - t0); // 0~1 插值
+
+    const p0 = this.points[segmentIndex].position;
+    const p1 = this.points[segmentIndex + 1].position;
+
+    // 线性插值位置
+    const position = [
+      p0[0] + (p1[0] - p0[0]) * localT,
+      p0[1] + (p1[1] - p0[1]) * localT,
+      (p0[2] || 0) + ((p1[2] || 0) - (p0[2] || 0)) * localT,
+    ];
+
+    // 姿态插值（可选）
+    let orientation = null;
+    const o0 = this.points[segmentIndex].orientation;
+    const o1 = this.points[segmentIndex + 1].orientation;
+    if (o0 && o1) {
+      orientation = Cesium.Quaternion.slerp(o0, o1, localT, new Cesium.Quaternion());
+    } else if (o0) {
+      orientation = o0;
+    }
+
+    return { position, orientation };
+  }
+
+  /**
+   * 设置动画总时长
+   * @param {number} duration - ms
+   */
+  setDuration(duration) {
+    this.duration = duration;
+  }
+
+  /**
+   * 设置倍速
+   * @param {number} speed
+   */
+  setSpeed(speed) {
+    this.speed = speed;
+  }
+
+  /**
+   * 重置动画
+   */
+  reset() {
+    this.time = 0;
   }
 }
