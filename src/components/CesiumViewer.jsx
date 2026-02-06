@@ -4,276 +4,172 @@ import * as Cesium from "cesium";
 Cesium.Ion.defaultAccessToken =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI5NmU0NDk5Ni1mOWNjLTQyNjYtODM3Yy1kYjAxNTc1MTU2ZjQiLCJpZCI6MjM3MjkwLCJpYXQiOjE3MjQ5NDU3OTF9.Yt2b-rHI-_1h1NoHmCzRL44E63E4Wq9d1m7ft3HZc3k";
 
+const DRONE = {
+  back: 500,
+  up: 2000,
+  pitch: -40,
+
+  trendWindow: 0.6,
+  dirSmooth: 0.2,
+  maxYawSpeed: 2.0, // deg / frame
+};
+
 export default forwardRef(CesiumViewer);
-function CesiumViewer({ player, points = [], duration = 60000 }, ref) {
-  const cesiumRef = useRef();
+
+function CesiumViewer({ player, points = [] }, ref) {
+  const domRef = useRef();
   const viewerRef = useRef();
   const entityRef = useRef();
-  const positionPropertyRef = useRef();
-  const isPlayingRef = useRef(false);
-  const lastAnimationFrameIdRef = useRef(null);
-  const cameraAnimationFrameIdRef = useRef(null);
-  const cameraPositionRef = useRef();
-  const targetPositionRef = useRef();
-  const startTimeRef = useRef(Cesium.JulianDate.now());
+  const posPropRef = useRef();
 
-  useImperativeHandle(ref, () => ({
-    handlePlay,
-  }));
+  const playingRef = useRef(false);
+  const rafEntityRef = useRef();
+  const rafCameraRef = useRef();
 
-  /**
-   * 飞到路线位置
-   */
-  const flyToRoute = () => {
-    if (!viewerRef.current || !points?.length) return;
-    const positions = points.map((p) => Cesium.Cartesian3.fromDegrees(...p));
-    // 计算路线的边界球
-    const boundingSphere = Cesium.BoundingSphere.fromPoints(positions);
-    function flyFromEarthToRoute(onComplete) {
-      // 确保整个路线都在视野内
-      viewerRef.current.camera.flyToBoundingSphere(boundingSphere, {
-        duration: 2.5, // 调整地图以包含路线
-        complete: onComplete,
-      });
-    }
-    flyFromEarthToRoute();
-  };
+  const smoothDirRef = useRef(null);
+  const headingRef = useRef(null);
+
+  useImperativeHandle(ref, () => ({ handlePlay }));
 
   useEffect(() => {
-    viewerRef.current = new Cesium.Viewer(cesiumRef.current, {
+    viewerRef.current = new Cesium.Viewer(domRef.current, {
       shouldAnimate: true,
+      animation: false,
       timeline: false,
-      terrain: Cesium.Terrain.fromWorldTerrain({
-        requestVertexNormals: true,
-        requestWaterMask: true,
-      }),
+      terrain: Cesium.Terrain.fromWorldTerrain(),
     });
 
     viewerRef.current.entities.add({
       polyline: {
-        positions: points.map((p) => Cesium.Cartesian3.fromDegrees(...p)),
-        width: 4,
-        material: Cesium.Color.fromCssColorString("#00ff00"),
+        positions: points.map(p => Cesium.Cartesian3.fromDegrees(...p)),
         clampToGround: true,
+        width: 4,
+        material: Cesium.Color.LIME,
       },
     });
 
-    flyToRoute();
-
-    positionPropertyRef.current = new Cesium.SampledPositionProperty();
+    posPropRef.current = new Cesium.SampledPositionProperty();
 
     entityRef.current = viewerRef.current.entities.add({
-      position: positionPropertyRef.current,
-      point: {
-        color: Cesium.Color.fromCssColorString("#ff0000"),
-        pixelSize: 10,
-        outlineColor: Cesium.Color.fromCssColorString("#fff"),
-        outlineWidth: 5,
-        heightReference: Cesium.HeightReference.NONE, // 高度自己控制
-        // heightReference: Cesium.HeightReference.CLAMP_TO_GROUND, // https://cesium.com/downloads/cesiumjs/releases/1.135/Build/Documentation/global.html#HeightReference
-      },
-      path: {
-        material: Cesium.Color.fromCssColorString("#ff0000"),
-        leadTime: 0,
-        trailTime: 60,
-        width: 2,
-        resolution: 0.1,
-      },
+      position: posPropRef.current,
+      point: { pixelSize: 10, color: Cesium.Color.RED },
     });
 
-    const { cameraPos, targetPos } = buildCameraTrack(
-      points,
-      startTimeRef.current,
-      duration,
-    );
-    cameraPositionRef.current = cameraPos;
-    targetPositionRef.current = targetPos;
+    return () => viewerRef.current?.destroy();
+  }, [points]);
 
-    return () => viewerRef.current.destroy();
-  }, [player, points, duration]);
+  function handlePlay() {
+    if (playingRef.current) return stop();
+    playingRef.current = true;
 
-  const handlePlay = () => {
-    if (isPlayingRef.current) {
-      isPlayingRef.current = false;
-      cancelAnimationFrame(lastAnimationFrameIdRef.current);
-      cancelAnimationFrame(cameraAnimationFrameIdRef.current);
-      lastAnimationFrameIdRef.current = null;
-      cameraAnimationFrameIdRef.current = null;
-      return;
-    }
     let last = performance.now();
-    let virtualTime = 0; // 虚拟时间（秒），作为 SampledPositionProperty 时间轴
+    let vt = 0;
 
-    // 移动点 tick 函数
     function tickEntity(now) {
-      const dt = now - last; // 秒
+      const dt = now - last;
       last = now;
-      virtualTime += dt / 1000;
+      vt += dt / 1000;
 
-      if (!player) {
-        return;
-      }
+      const state = player?.update(dt);
+      if (!state?.position) return stop();
 
-      const state = player.update(dt); // TrackPlayer 用 ms
-      if (!state || !state.position) {
-        cancelAnimationFrame(lastAnimationFrameIdRef.current);
-        cancelAnimationFrame(cameraAnimationFrameIdRef.current);
-        lastAnimationFrameIdRef.current = null;
-        cameraAnimationFrameIdRef.current = null;
-        isPlayingRef.current = false;
-        return;
-      }
-
-      // 更新实体位置
-      const cartesian = Cesium.Cartesian3.fromDegrees(...state.position);
-      entityRef.current.position = cartesian;
-
-      // 添加拖尾采样
-      const sampleTime = Cesium.JulianDate.addSeconds(
-        Cesium.JulianDate.now(),
-        virtualTime,
-        new Cesium.JulianDate(),
-      );
-      positionPropertyRef.current.addSample(sampleTime, cartesian);
-      if (state.orientation) {
-        entityRef.current.orientation = state.orientation;
-      }
-
-      lastAnimationFrameIdRef.current = requestAnimationFrame(tickEntity);
-    }
-
-    let elapsed = 0;
-    let lastTimeCamera = performance.now();
-    function tickCamera(now) {
-      const dt = (now - lastTimeCamera) / 1000;
-      lastTimeCamera = now;
-      elapsed += dt;
-
-      const time = Cesium.JulianDate.addSeconds(
-        startTimeRef.current,
-        elapsed,
-        new Cesium.JulianDate(),
-      );
-
-      // === 相机直接采样 ===
-      const camPos = cameraPositionRef.current.getValue(time);
-      const target = targetPositionRef.current.getValue(time);
-
-      console.log({
-        time,
-        camPos,
-        target,
-      });
-
-      if (camPos && target) {
-        viewerRef.current.camera.setView({
-          destination: camPos,
-          orientation: {
-            direction: Cesium.Cartesian3.normalize(
-              Cesium.Cartesian3.subtract(
-                target,
-                camPos,
-                new Cesium.Cartesian3(),
-              ),
-              new Cesium.Cartesian3(),
-            ),
-            up: viewerRef.current.camera.up,
-          },
-        });
-      }
-
-      cameraAnimationFrameIdRef.current = requestAnimationFrame(tickCamera);
-    }
-
-    isPlayingRef.current = true;
-    lastAnimationFrameIdRef.current = requestAnimationFrame(tickEntity);
-    cameraAnimationFrameIdRef.current = requestAnimationFrame(tickCamera);
-  };
-
-  /**
-   * 预计算相机轨迹
-   * totalDuration: ms
-   */
-  function buildCameraTrack(points, startTime, totalDuration) {
-    const cameraPos = new Cesium.SampledPositionProperty(); //new Cesium.SampledProperty(Cesium.Cartesian3);
-    const targetPos = new Cesium.SampledPositionProperty(); // new Cesium.SampledProperty(Cesium.Cartesian3);
-
-    const count = points.length;
-    const step = totalDuration / (1000 * (count - 1));
-
-    const pitch = Cesium.Math.toRadians(-25);
-    const headingStep = 100;
-    let lastHeadingStartIndex = 0;
-    let heading;
-
-    for (let i = 0; i < count; i++) {
+      const pos = Cesium.Cartesian3.fromDegrees(...state.position);
       const t = Cesium.JulianDate.addSeconds(
-        startTime,
-        i * step,
-        new Cesium.JulianDate(),
+        Cesium.JulianDate.now(),
+        vt,
+        new Cesium.JulianDate()
       );
-      const curr = Cesium.Cartesian3.fromDegrees(...points[i]);
-      if (heading && lastHeadingStartIndex + headingStep > i && i !== 0) {
-        // 保持一段距离再计算下一次 heading
-      } else {
-        lastHeadingStartIndex = i;
-        const next =
-          i < count - headingStep
-            ? Cesium.Cartesian3.fromDegrees(...points[i + headingStep])
-            : curr;
+      posPropRef.current.addSample(t, pos);
 
-        // 1️⃣ 计算前进方向（已经有了）
-        const dir = Cesium.Cartesian3.subtract(
-          next,
-          curr,
-          new Cesium.Cartesian3(),
-        );
-        try {
-          console.log({ dir }, i, curr, next);
-          Cesium.Cartesian3.normalize(dir, dir);
-        } catch (e) {
-          console.error("3333", e);
-          continue;
-        }
-        // 2️⃣ heading（沿着路线）
-        heading = Math.atan2(dir.x, dir.y);
-      }
-
-      // 3️⃣ 相机姿态（注意：这是“目标姿态”）
-      const hpr = new Cesium.HeadingPitchRoll(heading, pitch, 0);
-
-      // 4️⃣ 用 heading + pitch 构造旋转矩阵
-      const rotation = Cesium.Transforms.headingPitchRollToFixedFrame(
-        curr,
-        hpr,
-      );
-
-      // 5️⃣ 在“目标坐标系”里定义 offset（后方 500m，上方 1000m）
-      const offset = new Cesium.Cartesian3(0, -500, 2000);
-
-      // 6️⃣ 得到真正的相机世界坐标
-      const camPos = Cesium.Matrix4.multiplyByPoint(
-        rotation,
-        offset,
-        new Cesium.Cartesian3(),
-      );
-
-      cameraPos.addSample(t, camPos);
-      targetPos.addSample(t, curr);
+      rafEntityRef.current = requestAnimationFrame(tickEntity);
     }
 
-    cameraPos.setInterpolationOptions({
-      interpolationDegree: 2,
-      interpolationAlgorithm: Cesium.HermitePolynomialApproximation,
-    });
+    function tickCamera() {
+      const viewer = viewerRef.current;
+      const entity = entityRef.current;
+      if (!viewer || !entity) return;
 
-    targetPos.setInterpolationOptions({
-      interpolationDegree: 2,
-      interpolationAlgorithm: Cesium.HermitePolynomialApproximation,
-    });
+      const now = Cesium.JulianDate.now();
+      const curr = entity.position.getValue(now);
+      if (!curr) return requestAnimationFrame(tickCamera);
 
-    return { cameraPos, targetPos };
+      const trend = computeTrendDirection(posPropRef.current, now, DRONE.trendWindow);
+      if (!trend) return requestAnimationFrame(tickCamera);
+
+      if (!smoothDirRef.current) {
+        smoothDirRef.current = trend;
+      } else {
+        Cesium.Cartesian3.lerp(
+          smoothDirRef.current,
+          trend,
+          DRONE.dirSmooth,
+          smoothDirRef.current
+        );
+        Cesium.Cartesian3.normalize(smoothDirRef.current, smoothDirRef.current);
+      }
+
+      const enu = Cesium.Transforms.eastNorthUpToFixedFrame(curr);
+      const inv = Cesium.Matrix4.inverse(enu, new Cesium.Matrix4());
+      const local = Cesium.Matrix4.multiplyByPointAsVector(
+        inv,
+        smoothDirRef.current,
+        new Cesium.Cartesian3()
+      );
+
+      const targetHeading = Math.atan2(local.x, local.y);
+
+      if (headingRef.current == null) {
+        headingRef.current = targetHeading;
+      } else {
+        const max = Cesium.Math.toRadians(DRONE.maxYawSpeed);
+        const d = Cesium.Math.negativePiToPi(targetHeading - headingRef.current);
+        headingRef.current += Cesium.Math.clamp(d, -max, max);
+      }
+
+      const range = Math.sqrt(DRONE.back ** 2 + DRONE.up ** 2);
+
+      viewer.camera.lookAt(
+        curr,
+        new Cesium.HeadingPitchRange(
+          headingRef.current,
+          Cesium.Math.toRadians(DRONE.pitch),
+          range
+        )
+      );
+
+      // 🔑 关键：恢复世界坐标系
+      viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+
+      rafCameraRef.current = requestAnimationFrame(tickCamera);
+    }
+
+    rafEntityRef.current = requestAnimationFrame(tickEntity);
+    rafCameraRef.current = requestAnimationFrame(tickCamera);
   }
 
-  return <div ref={cesiumRef} style={{ height: "90vh" }} />;
+  function stop() {
+    playingRef.current = false;
+    cancelAnimationFrame(rafEntityRef.current);
+    cancelAnimationFrame(rafCameraRef.current);
+  }
+
+  return <div ref={domRef} style={{ height: "90vh" }} />;
+}
+
+function computeTrendDirection(prop, time, w) {
+  const os = [-w, -w / 2, 0, w / 2, w];
+  const ps = os
+    .map(o =>
+      prop.getValue(Cesium.JulianDate.addSeconds(time, o, new Cesium.JulianDate()))
+    )
+    .filter(Boolean);
+
+  if (ps.length < 2) return null;
+
+  const dir = Cesium.Cartesian3.subtract(
+    ps[ps.length - 1],
+    ps[0],
+    new Cesium.Cartesian3()
+  );
+  return Cesium.Cartesian3.normalize(dir, dir);
 }
