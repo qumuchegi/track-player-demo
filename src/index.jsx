@@ -2,6 +2,7 @@ import "cesium/Build/Cesium/Widgets/widgets.css";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./app";
+import './index.css'
 
 import "cesium/Build/Cesium/Widgets/widgets.css";
 window.CESIUM_BASE_URL = "/cesium";

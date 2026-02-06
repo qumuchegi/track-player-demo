@@ -13,7 +13,6 @@ export default function App() {
 
   const handleLoad = (text, name) => {
     const points = parseTrackFromText(text, name);
-    console.log({points})
     setPoints(points);
     setPlayer(new TrackPlayer(points, duration));
   };

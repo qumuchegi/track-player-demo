@@ -1,4 +1,10 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+} from "react";
 import * as Cesium from "cesium";
 
 Cesium.Ion.defaultAccessToken =
@@ -7,18 +13,18 @@ Cesium.Ion.defaultAccessToken =
 const DRONE = {
   back: 500,
   up: 2000,
-  pitch: -40,
+  pitch: -35,
 
-  trendWindow: 0.6,
-  dirSmooth: 0.2,
-  maxYawSpeed: 2.0, // deg / frame
+  trendWindow: 1.6,
+  dirSmooth: 1.5,
+  maxYawSpeed: 1.0, // deg / frame
 };
 
 export default forwardRef(CesiumViewer);
 
 function CesiumViewer({ player, points = [] }, ref) {
   const domRef = useRef();
-  const viewerRef = useRef();
+  const viewerRef = useRef(null);
   const entityRef = useRef();
   const posPropRef = useRef();
 
@@ -31,32 +37,84 @@ function CesiumViewer({ player, points = [] }, ref) {
 
   useImperativeHandle(ref, () => ({ handlePlay }));
 
+  /**
+   * 飞到路线位置
+   */
+  const flyToRoute = useCallback(() => {
+    if (!viewerRef.current || !points?.length) return;
+    const positions = points.map((p) => Cesium.Cartesian3.fromDegrees(...p));
+    // 计算路线的边界球
+    const boundingSphere = Cesium.BoundingSphere.fromPoints(positions);
+    function flyFromEarthToRoute(onComplete) {
+      // 确保整个路线都在视野内
+      viewerRef.current.camera.flyToBoundingSphere(boundingSphere, {
+        duration: 2.5, // 调整地图以包含路线
+        complete: onComplete,
+      });
+    }
+    flyFromEarthToRoute();
+  }, [points]);
+
   useEffect(() => {
     viewerRef.current = new Cesium.Viewer(domRef.current, {
       shouldAnimate: true,
       animation: false,
       timeline: false,
       terrain: Cesium.Terrain.fromWorldTerrain(),
-    });
+      animation: false, // 去掉动画控件
+      timeline: false, // 去掉时间轴
+      fullscreenButton: false, // 去掉全屏按钮
+      homeButton: false, // 去掉主页按钮
+      geocoder: false, // 去掉地理编码搜索框
+      sceneModePicker: false, // 去掉场景模式选择器
+      baseLayerPicker: false, // 去掉底图选择器
+      navigationHelpButton: false, // 去掉导航帮助按钮
+      infoBox: false, // 去掉信息框
+      selectionIndicator: false, // 去掉选择指示器
+      homeButton: true, // 确保 Home 按钮可用
+      useBrowserRecommendedResolution: true, // 默认 true
 
-    viewerRef.current.entities.add({
-      polyline: {
-        positions: points.map(p => Cesium.Cartesian3.fromDegrees(...p)),
-        clampToGround: true,
-        width: 4,
-        material: Cesium.Color.LIME,
+      contextOptions: {
+        antialias: true, // 关键：开启抗锯齿
       },
     });
+
+    // TODO: 完整路线
+    viewerRef.current.entities.add({
+      polyline: {
+        positions: points.map((p) => Cesium.Cartesian3.fromDegrees(...p)),
+        clampToGround: true,
+        width: 2,
+        material: Cesium.Color.WHITE,
+      },
+    });
+
+    flyToRoute();
 
     posPropRef.current = new Cesium.SampledPositionProperty();
 
     entityRef.current = viewerRef.current.entities.add({
       position: posPropRef.current,
-      point: { pixelSize: 10, color: Cesium.Color.RED },
+      point: {
+        color: Cesium.Color.fromCssColorString("#ff0000"),
+        pixelSize: 10,
+        outlineColor: Cesium.Color.fromCssColorString("#fff"),
+        outlineWidth: 5,
+        //heightReference: Cesium.HeightReference.CLAMP_TO_GROUND, // 高度自己控制
+      },
+      path: {
+        material: Cesium.Color.fromCssColorString("#ff0000"),
+        leadTime: 0,
+        trailTime: 60,
+        width: 2,
+        resolution: 0.1,
+        //clampToGround: true,
+        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND
+      },
     });
 
     return () => viewerRef.current?.destroy();
-  }, [points]);
+  }, [points, flyToRoute]);
 
   function handlePlay() {
     if (playingRef.current) return stop();
@@ -77,7 +135,7 @@ function CesiumViewer({ player, points = [] }, ref) {
       const t = Cesium.JulianDate.addSeconds(
         Cesium.JulianDate.now(),
         vt,
-        new Cesium.JulianDate()
+        new Cesium.JulianDate(),
       );
       posPropRef.current.addSample(t, pos);
 
@@ -93,7 +151,11 @@ function CesiumViewer({ player, points = [] }, ref) {
       const curr = entity.position.getValue(now);
       if (!curr) return requestAnimationFrame(tickCamera);
 
-      const trend = computeTrendDirection(posPropRef.current, now, DRONE.trendWindow);
+      const trend = computeTrendDirection(
+        posPropRef.current,
+        now,
+        DRONE.trendWindow,
+      );
       if (!trend) return requestAnimationFrame(tickCamera);
 
       if (!smoothDirRef.current) {
@@ -103,7 +165,7 @@ function CesiumViewer({ player, points = [] }, ref) {
           smoothDirRef.current,
           trend,
           DRONE.dirSmooth,
-          smoothDirRef.current
+          smoothDirRef.current,
         );
         Cesium.Cartesian3.normalize(smoothDirRef.current, smoothDirRef.current);
       }
@@ -113,7 +175,7 @@ function CesiumViewer({ player, points = [] }, ref) {
       const local = Cesium.Matrix4.multiplyByPointAsVector(
         inv,
         smoothDirRef.current,
-        new Cesium.Cartesian3()
+        new Cesium.Cartesian3(),
       );
 
       const targetHeading = Math.atan2(local.x, local.y);
@@ -122,7 +184,9 @@ function CesiumViewer({ player, points = [] }, ref) {
         headingRef.current = targetHeading;
       } else {
         const max = Cesium.Math.toRadians(DRONE.maxYawSpeed);
-        const d = Cesium.Math.negativePiToPi(targetHeading - headingRef.current);
+        const d = Cesium.Math.negativePiToPi(
+          targetHeading - headingRef.current,
+        );
         headingRef.current += Cesium.Math.clamp(d, -max, max);
       }
 
@@ -133,8 +197,8 @@ function CesiumViewer({ player, points = [] }, ref) {
         new Cesium.HeadingPitchRange(
           headingRef.current,
           Cesium.Math.toRadians(DRONE.pitch),
-          range
-        )
+          range,
+        ),
       );
 
       // 🔑 关键：恢复世界坐标系
@@ -159,8 +223,10 @@ function CesiumViewer({ player, points = [] }, ref) {
 function computeTrendDirection(prop, time, w) {
   const os = [-w, -w / 2, 0, w / 2, w];
   const ps = os
-    .map(o =>
-      prop.getValue(Cesium.JulianDate.addSeconds(time, o, new Cesium.JulianDate()))
+    .map((o) =>
+      prop.getValue(
+        Cesium.JulianDate.addSeconds(time, o, new Cesium.JulianDate()),
+      ),
     )
     .filter(Boolean);
 
@@ -169,7 +235,7 @@ function computeTrendDirection(prop, time, w) {
   const dir = Cesium.Cartesian3.subtract(
     ps[ps.length - 1],
     ps[0],
-    new Cesium.Cartesian3()
+    new Cesium.Cartesian3(),
   );
   return Cesium.Cartesian3.normalize(dir, dir);
 }
